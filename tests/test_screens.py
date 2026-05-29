@@ -74,3 +74,36 @@ async def test_settings_close_saves(tmp_path, monkeypatch):
         app.screen._settings.save()
         await pilot.pause()
     assert (tmp_path / "settings.json").exists()
+
+
+# --- BatchEditScreen ---
+
+from screens.batch_edit_screen import BatchEditScreen
+
+
+class BatchApp(App):
+    result: dict | None = None
+
+    def on_mount(self) -> None:
+        self.push_screen(BatchEditScreen(), self._on_result)
+
+    def _on_result(self, result: dict | None) -> None:
+        self.result = result
+
+
+@pytest.mark.asyncio
+async def test_batch_screen_mounts():
+    app = BatchApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        assert any(isinstance(s, BatchEditScreen) for s in app.screen_stack)
+
+
+@pytest.mark.asyncio
+async def test_batch_cancel_returns_none():
+    app = BatchApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.screen.dismiss(None)
+        await pilot.pause()
+    assert app.result is None
