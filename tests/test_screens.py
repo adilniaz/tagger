@@ -107,3 +107,54 @@ async def test_batch_cancel_returns_none():
         app.screen.dismiss(None)
         await pilot.pause()
     assert app.result is None
+
+
+# --- MainScreen ---
+
+from app import TaggerApp
+from widgets.file_list import FileList
+from widgets.tag_editor import TagEditor
+
+
+@pytest.mark.asyncio
+async def test_app_mounts_main_screen():
+    from screens.main_screen import MainScreen
+    app = TaggerApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        assert any(isinstance(s, MainScreen) for s in app.screen_stack)
+
+
+@pytest.mark.asyncio
+async def test_ctrl_b_pushes_browser_screen():
+    app = TaggerApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await pilot.press("ctrl+b")
+        await pilot.pause()
+        assert any(isinstance(s, BrowserScreen) for s in app.screen_stack)
+
+
+@pytest.mark.asyncio
+async def test_ctrl_s_pushes_settings_screen():
+    app = TaggerApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await pilot.press("ctrl+s")
+        await pilot.pause()
+        assert any(isinstance(s, SettingsScreen) for s in app.screen_stack)
+
+
+@pytest.mark.asyncio
+async def test_file_selected_message_loads_tag_editor(tmp_path):
+    p = tmp_path / "song.mp3"
+    p.write_bytes(b"")
+    app = TaggerApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        screen = app.screen  # MainScreen is the active screen
+        with patch("widgets.tag_editor.read", return_value={"title": "Hi"}), \
+             patch("widgets.tag_editor.Settings.load", return_value=Settings()):
+            screen.query_one(FileList).post_message(FileList.FileSelected(p))
+            await pilot.pause()
+        assert screen.query_one(TagEditor)._path == p
