@@ -1,7 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
-import datetime
 from typing import Any
 
 from PySide6.QtCore import (
@@ -23,11 +22,14 @@ COL_ARTIST = 5
 COL_ALBUM = 6
 NUM_COLS = 7
 HEADERS = ["", "Name", "Size", "Title", "Modified", "Artist", "Album"]
+SORT_ROLE = Qt.ItemDataRole.UserRole + 1
 
 
 @dataclass
 class _FileRow:
     path: Path
+    size_bytes: int = 0
+    mtime: float = 0.0
     size_str: str = ""
     mtime_str: str = ""
     title: str = ""
@@ -42,14 +44,20 @@ class TagLoaderThread(QThread):
     def __init__(self, paths: list[Path], parent: QWidget | None = None):
         super().__init__(parent)
         self._paths = paths
+        self._stop = False
 
     def run(self) -> None:
         for path in self._paths:
+            if self._stop:
+                break
             try:
                 tags = read(path)
             except Exception:
                 tags = {}
             self.tags_loaded.emit(path, tags)
+
+    def stop(self) -> None:
+        self._stop = True
 
 
 class FileTableModel(QAbstractTableModel):
@@ -71,7 +79,10 @@ class FileTableModel(QAbstractTableModel):
             return HEADERS[section]
         return None
 
-    def data(self, index: QModelIndex | QPersistentModelIndex, role: int = Qt.ItemDataRole.DisplayRole) -> Any:
+    def data(
+        self, index: QModelIndex | QPersistentModelIndex,
+        role: int = Qt.ItemDataRole.DisplayRole,
+    ) -> Any:
         if not index.isValid():
             return None
         row = self._rows[index.row()]
@@ -100,6 +111,21 @@ class FileTableModel(QAbstractTableModel):
 
         if role == Qt.ItemDataRole.UserRole:
             return row.path
+
+        if role == SORT_ROLE:
+            if col == COL_SIZE:
+                return row.size_bytes
+            if col == COL_MODIFIED:
+                return row.mtime
+            if col == COL_NAME:
+                return row.path.name.lower()
+            if col == COL_TITLE:
+                return row.title.lower()
+            if col == COL_ARTIST:
+                return row.artist.lower()
+            if col == COL_ALBUM:
+                return row.album.lower()
+            return None
 
         return None
 
@@ -133,6 +159,16 @@ class FileTableModel(QAbstractTableModel):
     def dirty_paths(self) -> list[Path]:
         return [r.path for r in self._rows if r.dirty]
 
+    def rename_path(self, old: Path, new: Path) -> None:
+        idx = self._path_index.get(old)
+        if idx is None:
+            return
+        self._rows[idx].path = new
+        del self._path_index[old]
+        self._path_index[new] = idx
+        name_idx = self.index(idx, COL_NAME)
+        self.dataChanged.emit(name_idx, name_idx)
+
 
 class FileTable(QWidget):
     selection_changed = Signal(list)  # list[Path]
@@ -142,6 +178,7 @@ class FileTable(QWidget):
         self._model = FileTableModel()
         self._proxy = QSortFilterProxyModel()
         self._proxy.setSourceModel(self._model)
+        self._proxy.setSortRole(SORT_ROLE)
 
         self._view = QTableView()
         self._view.setModel(self._proxy)
@@ -180,24 +217,7 @@ class FileTable(QWidget):
             paths = [path]
         else:
             paths = []
-
-        rows: list[_FileRow] = []
-        for p in paths:
-            try:
-                stat = p.stat()
-                size_str = _format_size(stat.st_size)
-                mtime = datetime.datetime.fromtimestamp(stat.st_mtime)
-                mtime_str = mtime.strftime("%-m/%-d/%y at %-I:%M %p")
-            except OSError:
-                size_str = ""
-                mtime_str = ""
-            rows.append(_FileRow(path=p, size_str=size_str, mtime_str=mtime_str))
-
-        self._model.set_rows(rows)
-
-        self._loader = TagLoaderThread(paths, self)
-        self._loader.tags_loaded.connect(self._model.update_tags)
-        self._loader.start()
+        self.load_files(paths)
 
     def set_dirty(self, path: Path, dirty: bool) -> None:
         self._model.set_dirty(path, dirty)
@@ -216,22 +236,47 @@ class FileTable(QWidget):
             try:
                 stat = p.stat()
                 size_str = _format_size(stat.st_size)
-                mtime = datetime.datetime.fromtimestamp(stat.st_mtime)
-                mtime_str = mtime.strftime("%-m/%-d/%y at %-I:%M %p")
+                mtime_str = _format_mtime(stat.st_mtime)
+                rows.append(_FileRow(
+                    path=p,
+                    size_bytes=stat.st_size,
+                    mtime=stat.st_mtime,
+                    size_str=size_str,
+                    mtime_str=mtime_str,
+                ))
             except OSError:
-                size_str = ""
-                mtime_str = ""
-            rows.append(_FileRow(path=p, size_str=size_str, mtime_str=mtime_str))
+                rows.append(_FileRow(path=p))
         self._model.set_rows(rows)
+        self._stop_loader()
         self._loader = TagLoaderThread([r.path for r in rows], self)
         self._loader.tags_loaded.connect(self._model.update_tags)
         self._loader.start()
 
+    def _stop_loader(self) -> None:
+        if self._loader is not None:
+            self._loader.stop()
+            self._loader.wait()
+
+    def shutdown(self) -> None:
+        self._stop_loader()
+
     def all_paths(self) -> list[Path]:
         return self._model.all_paths()
 
+    def selected_paths(self) -> list[Path]:
+        paths = []
+        for proxy_idx in self._view.selectionModel().selectedRows():
+            source_idx = self._proxy.mapToSource(proxy_idx)
+            path = self._model.data(source_idx, Qt.ItemDataRole.UserRole)
+            if path:
+                paths.append(path)
+        return paths
+
     def dirty_paths(self) -> list[Path]:
         return self._model.dirty_paths()
+
+    def rename_path(self, old: Path, new: Path) -> None:
+        self._model.rename_path(old, new)
 
     def select_paths(self, paths: list[Path]) -> None:
         self._ignore_selection = True
@@ -260,8 +305,7 @@ class FileTable(QWidget):
             path = self._model.data(source_idx, Qt.ItemDataRole.UserRole)
             if path:
                 paths.append(path)
-        if paths:
-            self.selection_changed.emit(paths)
+        self.selection_changed.emit(paths)
 
 
 def _format_size(size: int) -> str:
@@ -271,3 +315,11 @@ def _format_size(size: int) -> str:
             return f"{fsize:.0f} {unit}" if unit == "B" else f"{fsize:.1f} {unit}"
         fsize /= 1024
     return f"{fsize:.1f} TiB"
+
+
+def _format_mtime(timestamp: float) -> str:
+    import datetime
+    dt = datetime.datetime.fromtimestamp(timestamp)
+    hour = dt.hour % 12 or 12
+    ampm = "AM" if dt.hour < 12 else "PM"
+    return f"{dt.month}/{dt.day}/{dt.strftime('%y')} at {hour}:{dt.minute:02d} {ampm}"
