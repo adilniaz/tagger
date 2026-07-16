@@ -3,9 +3,9 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
-CONFIG_PATH = Path.home() / ".config" / "tagger" / "settings.json"
+from core.tag_io import EXTENDED_FIELDS  # noqa: F401 — re-exported
 
-EXTENDED_FIELDS = ["albumartist", "discnumber", "composer", "comment", "lyrics"]
+CONFIG_PATH = Path.home() / ".config" / "tagger" / "settings.json"
 
 
 @dataclass
