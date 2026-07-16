@@ -17,10 +17,11 @@ Usage:
 
   Each <path> can be a file or a directory (scanned non-recursively).
   Pass -r / --recursive to scan directories recursively.
+  Pass -f / --fix to write corrected tags back to the files.
 
 Exit code:
-  0  no mismatches found
-  1  at least one mismatch found
+  0  no mismatches found (or all fixed successfully)
+  1  at least one mismatch found (or fix failed for at least one file)
 """
 import argparse
 import sys
@@ -28,7 +29,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from core.tag_io import SUPPORTED_EXTENSIONS, read
+from core.tag_io import SUPPORTED_EXTENSIONS, read, write
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -87,6 +88,33 @@ def check_file(path: Path) -> list[_Issue]:
     return issues
 
 
+def fix_file(path: Path) -> list[_Issue]:
+    """Apply corrections derived from the filename. Returns the issues that were fixed."""
+    issues = check_file(path)
+    if not issues:
+        return []
+
+    parsed = _parse_filename(path)
+    assert parsed is not None  # check_file already returned early when None
+
+    expected_artist, expected_title = parsed
+    corrections: dict[str, str] = {}
+    for issue in issues:
+        if issue.field == "title":
+            corrections["title"] = expected_title
+        elif issue.field == "artist":
+            corrections["artist"] = expected_artist
+        elif issue.field == "album artist":
+            corrections["albumartist"] = expected_artist
+
+    try:
+        write(path, corrections)
+    except Exception as exc:
+        return [_Issue("(write error)", str(exc), "")]
+
+    return issues
+
+
 # ── path collection ───────────────────────────────────────────────────────────
 
 def _collect(roots: list[Path], recursive: bool) -> list[Path]:
@@ -117,6 +145,10 @@ def main() -> None:
         "-r", "--recursive", action="store_true",
         help="Scan directories recursively",
     )
+    parser.add_argument(
+        "-f", "--fix", action="store_true",
+        help="Write corrected tags back to files",
+    )
     args = parser.parse_args()
 
     files = _collect([Path(p) for p in args.paths], args.recursive)
@@ -124,22 +156,36 @@ def main() -> None:
         print("No supported audio/ebook files found.")
         sys.exit(0)
 
-    n_ok = n_skipped = n_mismatch = 0
+    n_ok = n_mismatch = 0
+    n_fixed = n_fix_error = 0
+    skipped: list[Path] = []
 
     for path in files:
         if _parse_filename(path) is None:
-            n_skipped += 1
+            skipped.append(path)
             continue
 
         issues = check_file(path)
-        if issues:
-            n_mismatch += 1
-            print(path.name)
-            for issue in issues:
-                print(issue)
-            print()
-        else:
+        if not issues:
             n_ok += 1
+            continue
+
+        n_mismatch += 1
+        print(path.name)
+        for issue in issues:
+            print(issue)
+
+        if args.fix:
+            fixed = fix_file(path)
+            write_errors = [i for i in fixed if i.field == "(write error)"]
+            if write_errors:
+                n_fix_error += 1
+                print(f"  ERROR fixing: {write_errors[0].found}")
+            else:
+                n_fixed += 1
+                print("  -> fixed")
+
+        print()
 
     total_checked = n_ok + n_mismatch
     parts = [
@@ -147,11 +193,17 @@ def main() -> None:
         f"{total_checked} file{'s' if total_checked != 1 else ''} checked",
         f"{n_ok} OK",
     ]
-    if n_skipped:
-        parts.append(f"{n_skipped} skipped (no 'artist - title' pattern)")
+    if args.fix and n_fixed:
+        parts.append(f"{n_fixed} fixed")
+    if args.fix and n_fix_error:
+        parts.append(f"{n_fix_error} fix error{'s' if n_fix_error != 1 else ''}")
+    if skipped:
+        parts.append(f"{len(skipped)} skipped (no 'artist - title' pattern)")
     print("  ".join(parts))
+    for p in skipped:
+        print(f"  skipped: {p.name}")
 
-    sys.exit(1 if n_mismatch else 0)
+    sys.exit(1 if (n_mismatch and not args.fix) or n_fix_error else 0)
 
 
 if __name__ == "__main__":
