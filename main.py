@@ -1,7 +1,8 @@
 import os
 import sys
 
-os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
+if sys.platform.startswith("linux"):
+    os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
 
 from PySide6.QtGui import QColor, QPalette
 from PySide6.QtWidgets import QApplication

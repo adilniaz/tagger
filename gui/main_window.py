@@ -1,14 +1,16 @@
 from __future__ import annotations
 from pathlib import Path
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
     QApplication, QDialog, QFileDialog, QMainWindow, QMessageBox,
     QSplitter, QToolBar,
 )
 
-from core.tag_io import BASIC_FIELDS, EXTENDED_FIELDS, FIELD_LABELS, SUPPORTED_EXTENSIONS, read, write
+from core.tag_io import (
+    BASIC_FIELDS, EXTENDED_FIELDS, FIELD_LABELS, SUPPORTED_EXTENSIONS, read, write,
+)
 from core.settings import Settings
 from gui.batch_edit_dialog import BatchEditDialog
 from gui.file_table import FileTable
@@ -69,6 +71,23 @@ class MainWindow(QMainWindow):
             lambda path, dirty: self._file_table.set_dirty(path, dirty)
         )
         self._tag_editor.file_saved.connect(self._file_table.set_clean)
+        self._tag_editor.file_renamed.connect(self._file_table.rename_path)
+
+        self._select_timer = QTimer(self)
+        self._select_timer.setSingleShot(True)
+        self._select_timer.setInterval(150)
+        self._select_timer.timeout.connect(self._do_load_selection)
+        self._pending_paths: list[Path] = []
+
+    def _do_load_selection(self) -> None:
+        paths = self._pending_paths
+        self._pending_paths = []
+        if not paths:
+            self._tag_editor.clear()
+        elif len(paths) == 1:
+            self._tag_editor.load(paths[0])
+        else:
+            self._tag_editor.load_multi(paths)
 
     def _open_folder(self) -> None:
         if not self._confirm_discard():
@@ -93,12 +112,8 @@ class MainWindow(QMainWindow):
         self._tag_editor.save()
 
     def _on_selection_changed(self, paths: list[Path]) -> None:
-        if not paths:
-            return
-        if len(paths) == 1:
-            self._tag_editor.load(paths[0])
-        else:
-            self._tag_editor.load_multi(paths)
+        self._pending_paths = list(paths)
+        self._select_timer.start()
 
     def _confirm_discard(self) -> bool:
         dirty = self._file_table.dirty_paths()
@@ -127,8 +142,9 @@ class MainWindow(QMainWindow):
         values = dialog.get_values()
         if not values:
             return
+        targets = self._file_table.selected_paths() or self._file_table.all_paths()
         errors: list[str] = []
-        for p in self._file_table.all_paths():
+        for p in targets:
             try:
                 tags = read(p)
                 tags.update(values)
@@ -139,8 +155,8 @@ class MainWindow(QMainWindow):
                 errors.append(f"{p.name}: {e}")
         if errors:
             QMessageBox.warning(self, "Batch Edit Errors", "\n".join(errors))
-        current = self._tag_editor._path
-        if current and current in set(self._file_table.all_paths()):
+        current = self._tag_editor.current_path
+        if current and current in set(targets):
             self._tag_editor.load(current)
 
     def _open_settings(self) -> None:
@@ -151,4 +167,5 @@ class MainWindow(QMainWindow):
         if not self._confirm_discard():
             event.ignore()
             return
+        self._file_table.shutdown()
         event.accept()
