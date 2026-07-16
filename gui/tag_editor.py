@@ -14,6 +14,7 @@ from core.settings import Settings
 class TagEditorPanel(QWidget):
     dirty_changed = Signal(Path, bool)
     file_saved = Signal(Path)
+    file_renamed = Signal(Path, Path)   # old_path, new_path
 
     _paths: list[Path]
 
@@ -22,9 +23,10 @@ class TagEditorPanel(QWidget):
         self._paths = []
         self._multi = False
         self._original: dict[str, str] = {}
+        self._filename_original = ""
         self._inputs: dict[str, QLineEdit] = {}
-        # Unsaved edits keyed by path; lets users switch files without losing work
-        self._edit_cache: dict[Path, dict[str, str]] = {}
+        # Cache: path → (filename_text, tag_values); survives file-switch without saving
+        self._edit_cache: dict[Path, tuple[str, dict[str, str]]] = {}
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(8, 8, 8, 8)
@@ -48,7 +50,7 @@ class TagEditorPanel(QWidget):
         self._rebuild()
 
     @property
-    def _path(self) -> Path | None:
+    def current_path(self) -> Path | None:
         return self._paths[0] if self._paths else None
 
     def _rebuild(self) -> None:
@@ -56,11 +58,16 @@ class TagEditorPanel(QWidget):
         while self._form_layout.rowCount() > 0:
             self._form_layout.removeRow(0)
 
+        # Filename field — always first
+        self._filename_input = QLineEdit()
+        self._filename_input.setEnabled(bool(self._paths) and not self._multi)
+        self._filename_input.textChanged.connect(self._on_text_changed)
+        self._form_layout.addRow("File name:", self._filename_input)
+
         settings = Settings.load()
         active_fields = BASIC_FIELDS + [
             f for f in EXTENDED_FIELDS if f in settings.enabled_extended
         ]
-
         for field in active_fields:
             label = FIELD_LABELS.get(field, field.title())
             inp = QLineEdit()
@@ -78,6 +85,8 @@ class TagEditorPanel(QWidget):
 
     @property
     def is_dirty(self) -> bool:
+        if not self._multi and self._filename_input.text() != self._filename_original:
+            return True
         return any(
             self._inputs[f].text() != self._original.get(f, "")
             for f in self._inputs
@@ -90,11 +99,12 @@ class TagEditorPanel(QWidget):
         self._load_paths(paths)
 
     def _load_paths(self, paths: list[Path]) -> None:
-        # Cache single-file edits before switching away
+        # Cache current single-file state before switching away
         if len(self._paths) == 1 and self.is_dirty:
-            self._edit_cache[self._paths[0]] = {
-                f: inp.text() for f, inp in self._inputs.items()
-            }
+            self._edit_cache[self._paths[0]] = (
+                self._filename_input.text(),
+                {f: inp.text() for f, inp in self._inputs.items()},
+            )
 
         self._paths = list(paths)
         self._multi = len(paths) > 1
@@ -113,16 +123,25 @@ class TagEditorPanel(QWidget):
 
         self._original = common
 
-        # For single-file: restore cached edits if present
-        display = (
-            self._edit_cache.get(paths[0], common)
-            if not self._multi and paths
-            else common
-        )
+        # Restore cached edits for single-file, otherwise use on-disk values
+        cached = self._edit_cache.get(paths[0]) if not self._multi and paths else None
+        on_disk_name = paths[0].name if not self._multi and paths else ""
+        filename_display = cached[0] if cached else on_disk_name
+        tag_display = cached[1] if cached else common
+        self._filename_original = paths[0].name if not self._multi and paths else ""
+
+        self._filename_input.blockSignals(True)
+        self._filename_input.setText(filename_display)
+        self._filename_input.setEnabled(not self._multi)
+        if self._multi:
+            self._filename_input.setPlaceholderText("Multiple files")
+        else:
+            self._filename_input.setPlaceholderText("")
+        self._filename_input.blockSignals(False)
 
         for field, inp in self._inputs.items():
             inp.blockSignals(True)
-            inp.setText(display.get(field, ""))
+            inp.setText(tag_display.get(field, ""))
             if self._multi:
                 all_vals = [t.get(field, "") for t in all_tags]
                 inp.setPlaceholderText(
@@ -143,6 +162,25 @@ class TagEditorPanel(QWidget):
             return
 
         if not self._multi:
+            old_path = self._paths[0]
+            new_name = self._filename_input.text().strip()
+
+            if new_name and new_name != self._filename_original:
+                error = _filename_error(new_name, self._filename_original, old_path.parent)
+                if error is not None:
+                    QMessageBox.critical(self, "Rename Failed", error)
+                    return
+                new_path = old_path.parent / new_name
+                try:
+                    old_path.rename(new_path)
+                except Exception as e:
+                    QMessageBox.critical(self, "Rename Failed", str(e))
+                    return
+                self._edit_cache.pop(old_path, None)
+                self._paths[0] = new_path
+                self._filename_original = new_name
+                self.file_renamed.emit(old_path, new_path)
+
             tags = {f: inp.text() for f, inp in self._inputs.items()}
             try:
                 write(self._paths[0], tags)
@@ -177,13 +215,35 @@ class TagEditorPanel(QWidget):
                 self._original[f] = v
             self._save_btn.setEnabled(False)
 
+    def clear(self) -> None:
+        self._paths = []
+        self._multi = False
+        self._original = {}
+        self._filename_original = ""
+        self._filename_input.blockSignals(True)
+        self._filename_input.clear()
+        self._filename_input.setEnabled(False)
+        self._filename_input.setPlaceholderText("")
+        self._filename_input.blockSignals(False)
+        for inp in self._inputs.values():
+            inp.blockSignals(True)
+            inp.clear()
+            inp.setEnabled(False)
+            inp.setPlaceholderText("")
+            inp.blockSignals(False)
+        self._save_btn.setEnabled(False)
+
     def clear_cache(self) -> None:
         self._edit_cache.clear()
 
     def reload_settings(self) -> None:
+        old_filename = self._filename_input.text()
         old_values = {f: inp.text() for f, inp in self._inputs.items()}
         old_placeholders = {f: inp.placeholderText() for f, inp in self._inputs.items()}
         self._rebuild()
+        self._filename_input.blockSignals(True)
+        self._filename_input.setText(old_filename)
+        self._filename_input.blockSignals(False)
         for field, inp in self._inputs.items():
             val = old_values.get(field, self._original.get(field, ""))
             inp.blockSignals(True)
@@ -192,3 +252,17 @@ class TagEditorPanel(QWidget):
                 inp.setPlaceholderText(old_placeholders[field])
             inp.blockSignals(False)
         self._save_btn.setEnabled(self.is_dirty)
+
+
+def _filename_error(new_name: str, original_name: str, parent_dir: Path) -> str | None:
+    if not new_name:
+        return "Filename cannot be empty."
+    p = Path(new_name)
+    if p.name != new_name:
+        return "Filename must not contain path separators."
+    if new_name in (".", ".."):
+        return f'"{new_name}" is not a valid filename.'
+    target = parent_dir / new_name
+    if target.exists() and new_name != original_name:
+        return f'"{new_name}" already exists.'
+    return None
