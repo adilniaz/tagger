@@ -1,6 +1,8 @@
 from __future__ import annotations
+import os
 from pathlib import Path
-from mutagen import File as MutagenFile  # noqa: F401
+from typing import Callable
+from mutagen import File as MutagenFile
 from ebooklib import epub
 from pypdf import PdfReader, PdfWriter
 
@@ -28,6 +30,16 @@ FIELD_LABELS: dict[str, str] = {
     "comment": "Comment",
     "lyrics": "Lyrics",
 }
+
+
+def _atomic_write(path: Path, write_fn: Callable[[Path], None]) -> None:
+    tmp = path.parent / f".{path.name}.tmp"
+    try:
+        write_fn(tmp)
+        os.replace(str(tmp), str(path))
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def read(path: Path) -> dict[str, str]:
@@ -120,12 +132,17 @@ def _write_epub(path: Path, tags: dict[str, str]) -> None:
     for field_key, dc_key in dc_map.items():
         if field_key in tags:
             book.set_unique_metadata("DC", dc_key, tags[field_key])
-    epub.write_epub(str(path), book)
+
+    def _do_write(p: Path) -> None:
+        epub.write_epub(str(p), book)
+    _atomic_write(path, _do_write)
 
 
 def _read_pdf(path: Path) -> dict[str, str]:
     reader = PdfReader(str(path))
     meta = reader.metadata
+    if meta is None:
+        return {}
     mapping = [
         ("title", meta.title),
         ("artist", meta.author),
@@ -137,17 +154,24 @@ def _read_pdf(path: Path) -> dict[str, str]:
 
 def _write_pdf(path: Path, tags: dict[str, str]) -> None:
     reader = PdfReader(str(path))
-    writer = PdfWriter()
-    for page in reader.pages:
-        writer.add_page(page)
-    writer.add_metadata({
-        "/Title": tags.get("title", ""),
-        "/Author": tags.get("artist", ""),
-        "/Subject": tags.get("genre", ""),
-        "/Creator": tags.get("albumartist", ""),
-    })
-    with open(str(path), "wb") as f:
-        writer.write(f)
+    writer = PdfWriter(clone_from=reader)
+    tag_to_pdf = {
+        "title": "/Title",
+        "artist": "/Author",
+        "genre": "/Subject",
+        "albumartist": "/Creator",
+    }
+    meta: dict[str, str] = {}
+    for tag_key, pdf_key in tag_to_pdf.items():
+        if tag_key in tags:
+            meta[pdf_key] = tags[tag_key]
+    if meta:
+        writer.add_metadata(meta)
+
+    def _do_write(p: Path) -> None:
+        with open(str(p), "wb") as f:
+            writer.write(f)
+    _atomic_write(path, _do_write)
 
 
 def _read_fb2(path: Path) -> dict[str, str]:
@@ -182,41 +206,63 @@ def _read_fb2(path: Path) -> dict[str, str]:
 
 def _write_fb2(path: Path, tags: dict[str, str]) -> None:
     import xml.etree.ElementTree as ET
+    ET.register_namespace("", "http://www.gribuser.ru/xml/fictionbook/2.0")
+    ET.register_namespace("l", "http://www.w3.org/1999/xlink")
     ns = {"fb": "http://www.gribuser.ru/xml/fictionbook/2.0"}
     try:
         tree = ET.parse(str(path))
-        root = tree.getroot()
-        title_info = root.find(".//fb:title-info", ns)
-        if title_info is None:
-            return
-        if "title" in tags:
-            bt = title_info.find("fb:book-title", ns)
-            if bt is not None:
-                bt.text = tags["title"]
-        tree.write(str(path), xml_declaration=True, encoding="utf-8")
     except ET.ParseError:
-        pass
+        raise IOError(f"Cannot parse FB2 file: {path}")
+    root = tree.getroot()
+    title_info = root.find(".//fb:title-info", ns)
+    if title_info is None:
+        return
+    if "title" in tags:
+        bt = title_info.find("fb:book-title", ns)
+        if bt is not None:
+            bt.text = tags["title"]
+    if "artist" in tags and tags["artist"]:
+        author = title_info.find("fb:author", ns)
+        if author is None:
+            author = ET.SubElement(title_info, "author")
+        parts = tags["artist"].rsplit(maxsplit=1)
+        fn = author.find("fb:first-name", ns)
+        ln = author.find("fb:last-name", ns)
+        if fn is None:
+            fn = ET.SubElement(author, "first-name")
+        if ln is None:
+            ln = ET.SubElement(author, "last-name")
+        fn.text = parts[0]
+        ln.text = parts[1] if len(parts) > 1 else ""
+
+    def _do_write(p: Path) -> None:
+        tree.write(str(p), xml_declaration=True, encoding="utf-8")
+    _atomic_write(path, _do_write)
 
 
 def _read_mobi(path: Path) -> dict[str, str]:
     try:
         import mobi
         import glob
+        import shutil
         import xml.etree.ElementTree as ET
-        _, extracted_dir = mobi.extract(str(path))
-        opf_files = glob.glob(f"{extracted_dir}/*.opf")
-        if not opf_files:
-            return {}
-        tree = ET.parse(opf_files[0])
-        root = tree.getroot()
-        ns = {"dc": "http://purl.org/dc/elements/1.1/"}
-        result: dict[str, str] = {}
-        t = root.find(".//dc:title", ns)
-        if t is not None and t.text:
-            result["title"] = t.text
-        a = root.find(".//dc:creator", ns)
-        if a is not None and a.text:
-            result["artist"] = a.text
-        return result
+        tempdir, _ = mobi.extract(str(path))
+        try:
+            opf_files = glob.glob(f"{tempdir}/**/*.opf", recursive=True)
+            if not opf_files:
+                return {}
+            tree = ET.parse(opf_files[0])
+            root = tree.getroot()
+            ns = {"dc": "http://purl.org/dc/elements/1.1/"}
+            result: dict[str, str] = {}
+            t = root.find(".//dc:title", ns)
+            if t is not None and t.text:
+                result["title"] = t.text
+            a = root.find(".//dc:creator", ns)
+            if a is not None and a.text:
+                result["artist"] = a.text
+            return result
+        finally:
+            shutil.rmtree(tempdir, ignore_errors=True)
     except Exception:
         return {}
